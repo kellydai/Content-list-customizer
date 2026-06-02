@@ -4,7 +4,15 @@ import pdfplumber
 import re
 import pandas as pd
 from io import BytesIO
-from openpyxl.styles import PatternFill, Font
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
+import math
+from rapidfuzz import fuzz, process
+
+# Fuzzy-match thresholds (0–100)
+FUZZY_HIGH   = 88   # >= this: HIGH confidence (auto-replace)
+FUZZY_MEDIUM = 70   # >= this but < HIGH: MEDIUM (user must confirm)
+                    # < MEDIUM: LOW/NONE (no match)
 
 st.set_page_config(page_title="ICRC Content List Customizer", page_icon="🏥", layout="wide")
 
@@ -103,7 +111,16 @@ def load_ref_df(file_bytes, filename):
     return load_ref_df_excel(file_bytes)
 
 def build_lookup(ref_df, id_col, desc_col):
-    lookup = {}
+    """
+    Returns a dict:
+      {
+        "exact":   {normalized_desc: [customer_id, ...]},
+        "entries": [(normalized_desc, original_desc, customer_id), ...],
+      }
+    `entries` is used for fuzzy matching when exact lookup fails.
+    """
+    exact = {}
+    entries = []
     for _, row in ref_df.iterrows():
         cid  = row.get(id_col)
         desc = row.get(desc_col)
@@ -111,8 +128,9 @@ def build_lookup(ref_df, id_col, desc_col):
         if pd.isna(desc) if isinstance(desc, float) else desc is None: continue
         nd = normalize(str(desc))
         if nd:
-            lookup.setdefault(nd, []).append(str(cid))
-    return lookup
+            exact.setdefault(nd, []).append(str(cid))
+            entries.append((nd, str(desc), str(cid)))
+    return {"exact": exact, "entries": entries}
 
 # ── ERP content list loading (Excel OR PDF) ───────────────────────────────
 
@@ -172,113 +190,185 @@ def _has_data_columns(entry, desc_key):
 
 def load_erp_items_pdf(file_bytes):
     """
-    Extract ERP content list rows from a PDF.
-    Returns (meta_dict, items_list, columns_list).
+    Extract ERP content list rows from a PDF — preserving batch structure.
+    A new batch starts whenever a page contains a 'CONTENT LIST' heading.
+    Continuation pages (no heading) attach to the current batch.
+
+    Returns a list of batches:
+      [{ "meta": {...}, "columns": [...], "items": [pdf_row_dict, ...] }, ...]
     """
-    meta    = {}
-    items   = []
-    columns = []
+    batches = []
+    current = None  # active batch dict
+
+    def new_batch():
+        return {"meta": {}, "columns": [], "items": []}
 
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
-            # ── title-block metadata ─────────────────────────────────────
             text = page.extract_text() or ""
+
+            # ── Detect a new batch by 'CONTENT LIST' heading on this page
+            if "CONTENT LIST" in text.upper():
+                if current and current["items"]:
+                    batches.append(current)
+                current = new_batch()
+
+            if current is None:
+                current = new_batch()
+
+            # ── title-block metadata for the active batch
             for line in text.splitlines():
                 l = line.strip()
-                if re.match(r"^KM\w+", l):          meta.setdefault("kit_code", l.split()[0])
-                if "assembly batch" in l.lower():    meta.setdefault("batch",    l)
-                if "po number" in l.lower():         meta.setdefault("po",       l)
-                if "content list" in l.lower():      meta.setdefault("title",    "CONTENT LIST")
-                if re.match(r"^SET,", l, re.I) and "kit_name" not in meta:
-                    meta["kit_name"] = l
+                if re.match(r"^KM\w+", l):
+                    current["meta"].setdefault("kit_code", l.split()[0])
+                if "assembly batch" in l.lower():
+                    current["meta"].setdefault("batch", l)
+                if "po number" in l.lower():
+                    current["meta"].setdefault("po", l)
+                if "content list" in l.lower():
+                    current["meta"].setdefault("title", "CONTENT LIST")
+                if re.match(r"^SET,", l, re.I) and "kit_name" not in current["meta"]:
+                    current["meta"]["kit_name"] = l
 
-            # ── table rows ───────────────────────────────────────────────
+            # ── table rows
             for table in _extract_tables_robust(page):
                 for row in table:
-                    # Normalise: None → "", collapse internal newlines within
-                    # a single pdfplumber cell (pdfplumber can return multi-line
-                    # strings for wrapped cells — keep them as \n).
                     clean = [str(c).strip() if c is not None else "" for c in row]
                     if not any(clean):
                         continue
 
-                    # Header row detection
+                    # Header row detection — establishes columns for this batch
                     if any("description" in c.lower() for c in clean):
-                        columns = clean
+                        current["columns"] = clean
                         continue
 
-                    if not columns:
+                    if not current["columns"]:
                         continue
 
-                    # Build entry dict; pad short rows with ""
-                    padded = clean + [""] * max(0, len(columns) - len(clean))
-                    entry  = {columns[i]: padded[i] for i in range(len(columns))}
+                    padded = clean + [""] * max(0, len(current["columns"]) - len(clean))
+                    entry = {current["columns"][i]: padded[i] for i in range(len(current["columns"]))}
 
                     desc_key = next(
-                        (k for k in columns if "description" in k.lower()), None
+                        (k for k in current["columns"] if "description" in k.lower()), None
                     )
                     desc_val = entry.get(desc_key, "").strip() if desc_key else ""
 
                     if not desc_val:
                         continue
 
-                    # ── continuation detection ───────────────────────────
-                    # A continuation row is one where the description cell has
-                    # content but ALL other columns are empty.
-                    # We do NOT rely on key-name comparison — we simply check
-                    # whether any non-description column has a non-empty value.
                     is_continuation = (
-                        bool(items)
+                        bool(current["items"])
                         and desc_key is not None
                         and not _has_data_columns(entry, desc_key)
                     )
 
                     if is_continuation:
-                        # Append wrapped text to the previous item's description
-                        prev_desc = items[-1].get(desc_key, "")
-                        items[-1][desc_key] = (prev_desc + "\n" + desc_val).strip()
+                        prev_desc = current["items"][-1].get(desc_key, "")
+                        current["items"][-1][desc_key] = (prev_desc + "\n" + desc_val).strip()
                     else:
-                        items.append(entry)
+                        current["items"].append(entry)
 
-    return meta, items, columns
+    if current and current["items"]:
+        batches.append(current)
+
+    return batches
 
 def load_erp_items(file_bytes, filename):
     """
-    Returns (items, source_format).
-    items: list of dicts with at least 'row' (int) and 'description' (str).
-      For PDF items, 'row' is a 1-based index (no real sheet row).
-    source_format: 'excel' or 'pdf'
+    Returns (items, source_format, pdf_meta, pdf_cols, pdf_batches).
+    items: flat list of dicts with 'row' (globally unique 1-based id),
+           'description', '_pdf_row', and 'batch_idx' (PDF only).
+    For Excel: pdf_batches is None.
+    For PDF: pdf_batches is the list returned by load_erp_items_pdf, with each
+             batch's items annotated with the same 'row' id as the flat list,
+             so generate_output_from_pdf can look up the customer ID per item.
     """
     if filename.lower().endswith(".pdf"):
-        meta, pdf_items, cols = load_erp_items_pdf(file_bytes)
-        desc_key = next((k for k in cols if "description" in k.lower()), cols[0] if cols else "description")
-        items = [{"row": i + 1,
-                  "description": row.get(desc_key, ""),
-                  "_pdf_row": row}
-                 for i, row in enumerate(pdf_items)]
-        return items, "pdf", meta, cols
+        batches = load_erp_items_pdf(file_bytes)
+        # First batch's meta+cols serve as fallback for legacy callers
+        first_meta = batches[0]["meta"] if batches else {}
+        first_cols = batches[0]["columns"] if batches else []
+
+        items = []
+        global_row = 0
+        for bi, batch in enumerate(batches):
+            desc_key = next(
+                (k for k in batch["columns"] if "description" in k.lower()),
+                batch["columns"][0] if batch["columns"] else "description",
+            )
+            for pdf_row in batch["items"]:
+                global_row += 1
+                pdf_row["_row_id"] = global_row  # back-reference for output
+                items.append({
+                    "row": global_row,
+                    "description": pdf_row.get(desc_key, ""),
+                    "_pdf_row": pdf_row,
+                    "batch_idx": bi,
+                })
+        return items, "pdf", first_meta, first_cols, batches
     else:
         items = load_erp_items_excel(file_bytes)
-        return items, "excel", {}, []
+        return items, "excel", {}, [], None
 
 # ── matching ───────────────────────────────────────────────────────────────
 
 def match_item(desc_bilingual, lookup):
-    if not desc_bilingual: return None, "LOW/NONE", []
+    """
+    Match strategy:
+      1. EXACT normalized match per description fragment (bilingual = split on \n).
+      2. FUZZY match (rapidfuzz token_set_ratio) against all reference entries
+         when exact match fails. token_set_ratio handles extra/missing words well
+         (e.g. content list has 'with paper label and Red cap', ref doesn't).
+
+    Returns (best_id, confidence_label, candidate_list).
+      confidence_label ∈ {"HIGH", "MEDIUM", "LOW/NONE"}
+    """
+    if not desc_bilingual:
+        return None, "LOW/NONE", []
+
+    exact   = lookup["exact"]
+    entries = lookup["entries"]
+
+    # ── 1. exact normalized match ────────────────────────────────────────
     candidates = {}
     for frag in str(desc_bilingual).split("\n"):
-        for cid in lookup.get(normalize(frag.strip()), []):
+        for cid in exact.get(normalize(frag.strip()), []):
             candidates[cid] = True
-    seen, unique = set(), []
-    for c in candidates:
-        if c not in seen: unique.append(c); seen.add(c)
-    if not unique:      return None,      "LOW/NONE", []
-    if len(unique) == 1: return unique[0], "HIGH",    unique
-    return unique[0], "MEDIUM", unique
+    unique = list(candidates.keys())
+    if unique:
+        if len(unique) == 1:
+            return unique[0], "HIGH", unique
+        return unique[0], "MEDIUM", unique
+
+    # ── 2. fuzzy fallback ────────────────────────────────────────────────
+    if not entries:
+        return None, "LOW/NONE", []
+
+    norm_choices = [e[0] for e in entries]
+    best_score = 0
+    best_idx   = None
+    for frag in str(desc_bilingual).split("\n"):
+        n = normalize(frag.strip())
+        if not n:
+            continue
+        result = process.extractOne(n, norm_choices, scorer=fuzz.token_set_ratio)
+        if result and result[1] > best_score:
+            best_score = result[1]
+            best_idx   = result[2]
+
+    if best_idx is None or best_score < FUZZY_MEDIUM:
+        return None, "LOW/NONE", []
+
+    best_cid = entries[best_idx][2]
+    label    = "HIGH" if best_score >= FUZZY_HIGH else "MEDIUM"
+    # surface the matched ID as the single candidate so the review UI can show it
+    return best_cid, label, [best_cid]
 
 # ── output generation ──────────────────────────────────────────────────────
 
 def apply_green(ws):
+    """Apply green fill + black wrapped text to every used cell."""
+    wrap_align = Alignment(wrap_text=True, vertical="center")
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
             cell = ws.cell(r, c)
@@ -286,65 +376,198 @@ def apply_green(ws):
             f = cell.font
             cell.font = Font(name=f.name, size=f.size, bold=f.bold,
                              italic=f.italic, color="000000")
+            cell.alignment = wrap_align
+
+
+# Rough character widths used for column auto-sizing & row height estimation.
+_COL_WIDTHS = {
+    "item code":   18,
+    "description": 55,
+    "quantity":     9,
+    "uom":         12,
+    "vendor":      22,
+    "batch":       16,
+    "expiry":      12,
+    "manufacturer":18,
+    "country":     14,
+}
+_DEFAULT_COL_WIDTH = 14
+_MAX_COL_WIDTH     = 60
+
+
+def _column_width_for(header):
+    h = str(header or "").lower()
+    for kw, w in _COL_WIDTHS.items():
+        if kw in h:
+            return w
+    return _DEFAULT_COL_WIDTH
+
+
+def _apply_print_layout(ws, header_row):
+    """
+    Make the sheet print cleanly:
+      • column widths sized to header type
+      • row heights tall enough that wrapped text isn't clipped
+      • print area restricted to the used range
+      • fit-to-width landscape, narrow margins
+    """
+    n_rows = ws.max_row
+    n_cols = ws.max_column
+    if n_rows == 0 or n_cols == 0:
+        return
+
+    # 1. Column widths
+    col_widths = {}
+    for ci in range(1, n_cols + 1):
+        header_val = ws.cell(header_row, ci).value if header_row else None
+        width = _column_width_for(header_val)
+        col_widths[ci] = width
+        ws.column_dimensions[get_column_letter(ci)].width = width
+
+    # 2. Row heights — based on wrapped-line count per cell
+    for r in range(1, n_rows + 1):
+        max_lines = 1
+        for ci in range(1, n_cols + 1):
+            val = ws.cell(r, ci).value
+            if val is None or val == "":
+                continue
+            col_w = col_widths.get(ci, _DEFAULT_COL_WIDTH)
+            # Each \n forces a new line; long lines wrap based on column width
+            for raw_line in str(val).split("\n"):
+                lines = max(1, math.ceil(len(raw_line) / max(col_w - 2, 1)))
+                max_lines = max(max_lines, lines)
+            max_lines = max(max_lines, str(val).count("\n") + 1)
+        # ~15pt per text line
+        ws.row_dimensions[r].height = max(18, max_lines * 15)
+
+    # 3. Print area = exactly the used range
+    last_col_letter = get_column_letter(n_cols)
+    ws.print_area = f"A1:{last_col_letter}{n_rows}"
+
+    # 4. Page setup: landscape, fit-to-width, narrow margins, centered
+    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_options.horizontalCentered = True
+    ws.page_margins.left = 0.3
+    ws.page_margins.right = 0.3
+    ws.page_margins.top = 0.5
+    ws.page_margins.bottom = 0.5
+    # Repeat header row on every printed page
+    if header_row:
+        ws.print_title_rows = f"{header_row}:{header_row}"
 
 def generate_output_excel(erp_bytes, confirmed_matches):
     wb = openpyxl.load_workbook(BytesIO(erp_bytes), data_only=False)
     ws = wb.active
-    _, _, item_code_col = find_erp_table_excel(ws)
+    header_row, _, item_code_col = find_erp_table_excel(ws)
     ic = item_code_col or 1
     for row_num, cid in confirmed_matches.items():
         ws.cell(row_num, ic).value = cid or None
     apply_green(ws)
+    _apply_print_layout(ws, header_row or 1)
     out = BytesIO(); wb.save(out)
     return out.getvalue()
 
-def generate_output_from_pdf(erp_bytes, confirmed_matches, pdf_meta, pdf_cols, erp_items):
-    """Build a fresh Excel from PDF-extracted data + confirmed customer IDs."""
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Content list"
+def _safe_sheet_name(name, existing):
+    """Excel sheet name: max 31 chars, no \\/*?:[] and must be unique."""
+    name = re.sub(r"[\\/*?:\[\]]", "-", str(name)).strip() or "Content list"
+    name = name[:31]
+    base, n = name, 2
+    while name in existing:
+        suffix = f" ({n})"
+        name = base[: 31 - len(suffix)] + suffix
+        n += 1
+    return name
+
+
+def _write_batch_sheet(ws, batch, confirmed_matches):
+    """Write a single batch's title block + data table into the given sheet."""
+    meta = batch.get("meta", {})
+    cols = batch.get("columns", []) or []
+    items = batch.get("items", [])
 
     row_ptr = 1
 
-    # Title block
     def write_title_cell(r, c, val, bold=False):
         cell = ws.cell(r, c, val)
-        if bold: cell.font = Font(bold=True)
+        if bold:
+            cell.font = Font(bold=True)
 
-    write_title_cell(row_ptr, 1, pdf_meta.get("title", "CONTENT LIST"), bold=True); row_ptr += 1
-    if "kit_code" in pdf_meta:
-        write_title_cell(row_ptr, 1, pdf_meta["kit_code"], bold=True); row_ptr += 1
-    if "kit_name" in pdf_meta:
-        write_title_cell(row_ptr, 1, pdf_meta["kit_name"]); row_ptr += 2
-    if "batch" in pdf_meta:
-        write_title_cell(row_ptr, 1, pdf_meta["batch"]); row_ptr += 1
-    if "po" in pdf_meta:
-        write_title_cell(row_ptr, 1, pdf_meta["po"]); row_ptr += 2
+    write_title_cell(row_ptr, 1, meta.get("title", "CONTENT LIST"), bold=True); row_ptr += 1
+    if "kit_code" in meta:
+        write_title_cell(row_ptr, 1, meta["kit_code"], bold=True); row_ptr += 1
+    if "kit_name" in meta:
+        write_title_cell(row_ptr, 1, meta["kit_name"]); row_ptr += 2
+    if "batch" in meta:
+        write_title_cell(row_ptr, 1, meta["batch"]); row_ptr += 1
+    if "po" in meta:
+        write_title_cell(row_ptr, 1, meta["po"]); row_ptr += 2
 
-    # Header row — prepend "Item code" if not already present
-    desc_key  = next((k for k in pdf_cols if "description" in k.lower()), None)
-    has_ic    = any("item code" in k.lower() or k.lower() == "code" for k in pdf_cols)
-    out_cols  = (pdf_cols if has_ic else ["Item code"] + pdf_cols)
+    # Header row — prepend "Item code" if not present
+    has_ic = any("item code" in k.lower() or k.lower() == "code" for k in cols)
+    out_cols = cols if has_ic else ["Item code"] + cols
 
     for ci, col in enumerate(out_cols, 1):
-        ws.cell(row_ptr, ci, col)
+        cell = ws.cell(row_ptr, ci, col)
+        cell.font = Font(bold=True)
     header_row = row_ptr
     row_ptr += 1
 
-    # Data rows
-    ic_col_idx = next((i + 1 for i, k in enumerate(out_cols) if "item code" in k.lower() or k.lower() == "code"), 1)
-    for item in erp_items:
-        cid = confirmed_matches.get(item["row"])
-        pdf_row = item.get("_pdf_row", {})
+    ic_col_idx = next(
+        (i + 1 for i, k in enumerate(out_cols) if "item code" in k.lower() or k.lower() == "code"),
+        1,
+    )
+    for pdf_row in items:
+        row_id = pdf_row.get("_row_id")
+        cid = confirmed_matches.get(row_id)
         for ci, col in enumerate(out_cols, 1):
-            if col == out_cols[ic_col_idx - 1] and not has_ic:
+            if ci == ic_col_idx:
+                # Item-code column: write the confirmed customer ID
                 ws.cell(row_ptr, ci, cid or "")
             else:
                 ws.cell(row_ptr, ci, pdf_row.get(col, ""))
         row_ptr += 1
 
     apply_green(ws)
-    out = BytesIO(); wb.save(out)
+    _apply_print_layout(ws, header_row)
+
+
+def _sheet_name_from_batch(batch, fallback):
+    """Derive a friendly sheet name from batch metadata."""
+    meta = batch.get("meta", {})
+    # Prefer the part after 'Assembly Batch:' if present
+    batch_str = meta.get("batch", "")
+    if batch_str:
+        after = batch_str.split(":", 1)[-1].strip()
+        if after:
+            return after
+    return meta.get("kit_code") or fallback
+
+
+def generate_output_from_pdf(erp_bytes, confirmed_matches, pdf_batches):
+    """Build a fresh Excel from PDF-extracted batches — one sheet per batch."""
+    wb = openpyxl.Workbook()
+    # Remove the auto-created default sheet so we control sheet order
+    default_ws = wb.active
+    wb.remove(default_ws)
+
+    used = set()
+    for bi, batch in enumerate(pdf_batches, 1):
+        sheet_name = _safe_sheet_name(
+            _sheet_name_from_batch(batch, f"Content list {bi}"), used
+        )
+        used.add(sheet_name)
+        ws = wb.create_sheet(sheet_name)
+        _write_batch_sheet(ws, batch, confirmed_matches)
+
+    if not pdf_batches:
+        wb.create_sheet("Content list")  # empty fallback
+
+    out = BytesIO()
+    wb.save(out)
     return out.getvalue()
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -354,6 +577,7 @@ def generate_output_from_pdf(erp_bytes, confirmed_matches, pdf_meta, pdf_cols, e
 DEFAULTS = dict(step=1, erp_bytes=None, erp_filename="", ref_bytes=None, ref_filename="",
                 ref_df=None, id_col=None, desc_col=None, lookup=None,
                 erp_items=None, erp_format="excel", pdf_meta={}, pdf_cols=[],
+                pdf_batches=None,
                 matches=None, output_bytes=None)
 for k, v in DEFAULTS.items():
     if k not in st.session_state: st.session_state[k] = v
@@ -462,7 +686,7 @@ elif st.session_state.step == 2:
                 st.session_state.lookup   = build_lookup(ref_df, id_col, desc_col)
 
                 with st.spinner("Parsing ERP file and matching…"):
-                    items, fmt, pdf_meta, pdf_cols = load_erp_items(
+                    items, fmt, pdf_meta, pdf_cols, pdf_batches = load_erp_items(
                         st.session_state.erp_bytes, st.session_state.erp_filename)
 
                 if not items:
@@ -476,11 +700,12 @@ elif st.session_state.step == 2:
                     item["confidence"]  = conf
                     item["candidates"]  = cands
 
-                st.session_state.erp_items  = items
-                st.session_state.erp_format = fmt
-                st.session_state.pdf_meta   = pdf_meta
-                st.session_state.pdf_cols   = pdf_cols
-                st.session_state.matches    = {i["row"]: i["matched_id"] for i in items}
+                st.session_state.erp_items   = items
+                st.session_state.erp_format  = fmt
+                st.session_state.pdf_meta    = pdf_meta
+                st.session_state.pdf_cols    = pdf_cols
+                st.session_state.pdf_batches = pdf_batches
+                st.session_state.matches     = {i["row"]: i["matched_id"] for i in items}
                 st.session_state.step       = 3
                 st.rerun()
 
@@ -539,9 +764,7 @@ elif st.session_state.step == 3:
                 if st.session_state.erp_format == "pdf":
                     out = generate_output_from_pdf(
                         st.session_state.erp_bytes, matches,
-                        st.session_state.pdf_meta,
-                        st.session_state.pdf_cols,
-                        st.session_state.erp_items)
+                        st.session_state.pdf_batches or [])
                 else:
                     out = generate_output_excel(st.session_state.erp_bytes, matches)
             st.session_state.output_bytes = out

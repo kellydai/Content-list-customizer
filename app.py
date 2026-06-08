@@ -8,6 +8,7 @@ from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 import math
 from rapidfuzz import fuzz, process
+import fitz  # PyMuPDF, used by the Label colorizer
 
 # Fuzzy-match thresholds (0–100)
 FUZZY_HIGH   = 88   # >= this: HIGH confidence (auto-replace)
@@ -366,17 +367,24 @@ def match_item(desc_bilingual, lookup):
 
 # ── output generation ──────────────────────────────────────────────────────
 
-def apply_green(ws):
-    """Apply green fill + black wrapped text to every used cell."""
+def apply_text_format(ws):
+    """Apply wrap-text + black font to every used cell. No fill (white background)."""
     wrap_align = Alignment(wrap_text=True, vertical="center")
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
             cell = ws.cell(r, c)
-            cell.fill = green_fill
             f = cell.font
             cell.font = Font(name=f.name, size=f.size, bold=f.bold,
                              italic=f.italic, color="000000")
             cell.alignment = wrap_align
+
+
+# Kept for reference; the content list output no longer fills cells green.
+def apply_green(ws):
+    apply_text_format(ws)
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            ws.cell(r, c).fill = green_fill
 
 
 # Rough character widths used for column auto-sizing & row height estimation.
@@ -466,7 +474,7 @@ def generate_output_excel(erp_bytes, confirmed_matches):
     ic = item_code_col or 1
     for row_num, cid in confirmed_matches.items():
         ws.cell(row_num, ic).value = cid or None
-    apply_green(ws)
+    apply_text_format(ws)
     _apply_print_layout(ws, header_row or 1)
     out = BytesIO(); wb.save(out)
     return out.getvalue()
@@ -531,7 +539,7 @@ def _write_batch_sheet(ws, batch, confirmed_matches):
                 ws.cell(row_ptr, ci, pdf_row.get(col, ""))
         row_ptr += 1
 
-    apply_green(ws)
+    apply_text_format(ws)
     _apply_print_layout(ws, header_row)
 
 
@@ -545,6 +553,31 @@ def _sheet_name_from_batch(batch, fallback):
         if after:
             return after
     return meta.get("kit_code") or fallback
+
+
+# ── Label colorizer (separate tool) ───────────────────────────────────────
+
+def colorize_pdf_pages_green(pdf_bytes, green_hex=GREEN_HEX):
+    """
+    Paint every page of `pdf_bytes` with a green background, leaving the
+    existing text/lines on top untouched. Returns the modified PDF as bytes.
+
+    Implementation: insert a full-page filled rectangle BELOW existing
+    content (overlay=False) using PyMuPDF.
+    """
+    r = int(green_hex[0:2], 16) / 255
+    g = int(green_hex[2:4], 16) / 255
+    b = int(green_hex[4:6], 16) / 255
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        for page in doc:
+            page.draw_rect(page.rect, color=None, fill=(r, g, b), overlay=False)
+        out = BytesIO()
+        doc.save(out)
+    finally:
+        doc.close()
+    return out.getvalue()
 
 
 def generate_output_from_pdf(erp_bytes, confirmed_matches, pdf_batches):
@@ -587,12 +620,66 @@ def reset():
     st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════
-# HEADER + PROGRESS
+# SIDEBAR — choose tool
+# ══════════════════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.header("🛠️  Tools")
+    tool = st.radio(
+        "Pick a tool",
+        options=["Content List Customizer", "Label Colorizer (PDF → green)"],
+        label_visibility="collapsed",
+    )
+    st.caption(
+        "• **Content List Customizer** — replace Sofia item codes with "
+        "customer codes and export a clean Excel.\n\n"
+        "• **Label Colorizer** — apply Pantone 340U green background to "
+        "every page of a label PDF."
+    )
+
+# ══════════════════════════════════════════════════════════════════════════
+# TOOL 2 — Label Colorizer  (early return so the rest of the file is skipped)
+# ══════════════════════════════════════════════════════════════════════════
+if tool.startswith("Label"):
+    st.title("🟩 Label Colorizer")
+    st.caption(
+        "Upload a label PDF; every page background is filled with "
+        f"Pantone 340U (#{GREEN_HEX}). Text and lines stay readable on top."
+    )
+
+    label_file = st.file_uploader("Upload label PDF", type=["pdf"])
+
+    if label_file:
+        with st.spinner("Applying green background…"):
+            try:
+                green_bytes = colorize_pdf_pages_green(label_file.read())
+            except Exception as e:
+                st.error(f"Failed to colorize PDF: {e}")
+                st.stop()
+
+        st.success("Done!")
+        stem = re.sub(r"\.pdf$", "", label_file.name, flags=re.I)
+        st.download_button(
+            label="⬇️  Download green-background PDF",
+            data=green_bytes,
+            file_name=f"{stem}_green.pdf",
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True,
+        )
+    else:
+        st.info("Pick a PDF above to colorize.")
+
+    st.stop()  # don't render the Content List flow below
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# HEADER + PROGRESS  (Content List Customizer)
 # ══════════════════════════════════════════════════════════════════════════
 
 st.title("🏥 ICRC Content List Customizer")
 st.caption("Upload an ERP content list (Excel or PDF) and a customer reference list (Excel or PDF) "
-           "to produce a branded Excel output.")
+           "to produce a clean Excel output.")
 
 STEP_LABELS = ["1 · Upload", "2 · Confirm Columns", "3 · Review Matches", "4 · Download"]
 pcols = st.columns(len(STEP_LABELS))
@@ -783,7 +870,11 @@ elif st.session_state.step == 4:
     src_fmt = "PDF" if st.session_state.erp_format == "pdf" else "Excel"
     st.success(f"✅ File ready — converted from **{src_fmt}** · "
                f"**{matched_count}** rows with customer ID · **{blank_count}** left blank.")
-    st.write(f"Green fill: `#{GREEN_HEX}` (Pantone 340 U) · Text: black")
+    st.caption(
+        "White background · black text · landscape fit-to-page · "
+        "print area restricted to the data range. "
+        "Need a green-branded label? Pick the **Label Colorizer** tool in the sidebar."
+    )
 
     # Derive a sensible output filename
     stem = re.sub(r"\.(xlsx|pdf)$", "", st.session_state.erp_filename, flags=re.I)

@@ -208,28 +208,83 @@ def load_erp_items_pdf(file_bytes):
         for page in pdf.pages:
             text = page.extract_text() or ""
 
-            # ── Detect a new batch by 'CONTENT LIST' heading on this page
-            if "CONTENT LIST" in text.upper():
+            # ── Detect a new batch.
+            # Primary signal: 'CONTENT LIST' heading text on this page.
+            # Fallback: page's first non-empty line is a bare kit-code token
+            # (some exports drop the 'CONTENT LIST' text entirely; continuation
+            # pages start with a data row instead, so they won't match).
+            stripped_lines = [s.strip() for s in text.splitlines() if s.strip()]
+            first_line = stripped_lines[0] if stripped_lines else ""
+            starts_with_kit_code = bool(
+                re.fullmatch(r"[A-Z][A-Z0-9]{5,}", first_line)
+            )
+            if "CONTENT LIST" in text.upper() or starts_with_kit_code:
                 if current and current["items"]:
                     batches.append(current)
                 current = new_batch()
+                # Ensure the title is present even if the PDF lacks the heading
+                current["meta"]["title"] = "CONTENT LIST"
+                # If we used the kit-code fallback, capture it now — the
+                # line-iteration gate (content_list_seen) won't fire later.
+                if starts_with_kit_code:
+                    current["meta"]["kit_code"] = first_line
 
             if current is None:
                 current = new_batch()
 
             # ── title-block metadata for the active batch
+            content_list_seen = False
             for line in text.splitlines():
                 l = line.strip()
-                if re.match(r"^KM\w+", l):
-                    current["meta"].setdefault("kit_code", l.split()[0])
-                if "assembly batch" in l.lower():
-                    current["meta"].setdefault("batch", l)
-                if "po number" in l.lower():
-                    current["meta"].setdefault("po", l)
-                if "content list" in l.lower():
+                if not l:
+                    continue
+                low = l.lower()
+
+                if "content list" in low:
                     current["meta"].setdefault("title", "CONTENT LIST")
-                if re.match(r"^SET,", l, re.I) and "kit_name" not in current["meta"]:
+                    content_list_seen = True
+                    continue
+
+                # Kit code = first all-uppercase alphanumeric token after
+                # CONTENT LIST (handles both 'KMEDCTTK5UM3AB' and 'MEDCTTK5UM3CA').
+                if (content_list_seen
+                        and "kit_code" not in current["meta"]
+                        and re.fullmatch(r"[A-Z][A-Z0-9]{5,}", l)):
+                    current["meta"]["kit_code"] = l
+                    continue
+
+                # Kit name = either old-style 'SET, …' or new-style line that
+                # contains 'Kit' AND a dash separator.
+                if "kit_name" not in current["meta"] and (
+                    re.match(r"^SET,", l, re.I)
+                    or ("kit" in low and "-" in l)
+                ):
                     current["meta"]["kit_name"] = l
+                    continue
+
+                # Labelled fields
+                if "assembly batch" in low or "batch number" in low:
+                    current["meta"].setdefault("batch", l)
+
+                # AMEX Project Code and Shortest Expiry are often on the
+                # same line in the PDF — split before storing.
+                if "amex project code" in low or "shortest expiry" in low:
+                    parts = re.split(
+                        r"\s{2,}|\s+(?=Shortest Expiry)",
+                        l, flags=re.I,
+                    )
+                    for part in parts:
+                        plow = part.lower()
+                        if "amex project code" in plow:
+                            current["meta"].setdefault("project_code", part.strip())
+                        elif "shortest expiry" in plow:
+                            current["meta"].setdefault("expiry", part.strip())
+
+                if "who ctt" in low and "kit_name" not in current["meta"]:
+                    # Edge case: 'WHO CTT' line without 'kit' word but still descriptive
+                    current["meta"]["kit_name"] = l
+                if "po number" in low:
+                    current["meta"].setdefault("po", l)
 
             # ── table rows
             for table in _extract_tables_robust(page):
@@ -511,6 +566,10 @@ def _write_batch_sheet(ws, batch, confirmed_matches):
         write_title_cell(row_ptr, 1, meta["kit_name"]); row_ptr += 2
     if "batch" in meta:
         write_title_cell(row_ptr, 1, meta["batch"]); row_ptr += 1
+    if "project_code" in meta:
+        write_title_cell(row_ptr, 1, meta["project_code"]); row_ptr += 1
+    if "expiry" in meta:
+        write_title_cell(row_ptr, 1, meta["expiry"]); row_ptr += 1
     if "po" in meta:
         write_title_cell(row_ptr, 1, meta["po"]); row_ptr += 2
 
